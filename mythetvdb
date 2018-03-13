@@ -27,7 +27,7 @@ $titles = array(
     "Battlestar Galactica" => "Battlestar Galactica (2003)"
 );
 
-$key = "C2BB0D2257D5EB83";
+$key = "xxxxxxxxxxxxxxxx";
 
 $mirrors = file_get_contents("http://thetvdb.com/api/$key/mirrors.xml");
 $xml = new SimpleXMLElement($mirrors);
