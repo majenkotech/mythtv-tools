@@ -1,0 +1,5 @@
+{
+    "require": {
+        "majenkotech/dbwrapper": "^0.2.1"
+    }
+}

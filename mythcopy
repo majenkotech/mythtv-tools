@@ -1,0 +1,222 @@
+#!/usr/bin/php
+<?php
+
+require_once __DIR__ . "/vendor/autoload.php";
+
+$configfile = file_get_contents(getenv("HOME") . "/.mythtv/config.xml");
+$config = new SimpleXMLElement($configfile);
+
+$db = new \Majenkotech\DB(
+    $config->Database->UserName,
+    $config->Database->Password,
+    $config->Database->Host,
+    $config->Database->DatabaseName
+);
+
+$roots = getStorageGroup("Export");
+if (!$roots) {
+    print "Error: No 'Export' storage group defined\n";
+    exit(10);
+}
+
+$root = $roots[0];
+
+$filePaths = array();
+
+$def = getStorageGroup("Default");
+foreach ($def as $dir) {
+    $filePaths[] = $dir;
+}
+
+$lt = getStorageGroup("LiveTV");
+foreach ($lt as $dir) {
+    $filePaths[] = $dir;
+}
+
+$opts = getopt("t:s:d:i:hcmufviC");
+if(array_key_exists('h',$opts) or (!array_key_exists('t',$opts) and !array_key_exists('i',$opts)))
+{
+	usage();
+}
+
+$force = array_key_exists('f',$opts) ? true : false;
+
+if(array_key_exists('t',$opts))
+{
+	$title = $opts['t'];
+	$subtitle = array_key_exists('s',$opts) ? $opts['s'] : '';
+
+	print "Searching for $title - $subtitle\n";
+
+	if(array_key_exists('u',$opts))
+	{
+		$q = $db->query("SELECT * FROM recorded WHERE cutlist = 1 AND title like :t AND subtitle like :s order by title, subtitle",
+            array("t" => "%$title%", "s" => "%$subtitle%"));
+	} else {
+		$q = $db->query("SELECT * FROM recorded WHERE watched=1 AND cutlist = 1 AND title like :t AND subtitle like :s order by title, subtitle",
+            array("t" => "%$title%", "s" => "%$subtitle%"));
+	}
+
+	while($r = $db->nextRecord($q)) {
+        $filepath = false;
+        foreach ($filePaths as $fp) {
+            $testfile = $fp . "/" . $r->basename;
+            if (file_exists($testfile)) {
+                $filepath = $testfile;
+            }
+        }
+
+        if ($filepath === false) {
+            continue;
+        }
+
+		$n = substr($r->basename,0,-4);
+        $destination = generateFilename($r);
+        $dpath = implode("/", $destination);
+        $dpath2 = str_replace(".mpg", ".mkv", $dpath);
+
+        if ((file_exists($root . $dpath) || file_exists("$root$dpath2")) && !array_key_exists('f', $opts)) {
+            continue;
+        }
+
+        print "  Found " . $dpath;
+        if (array_key_exists('v', $opts)) {
+            print " (" . $filepath . ")";
+        }
+
+        if (array_key_exists('c', $opts) || array_key_exists('m', $opts)) {
+            print " [transcoding...";
+            makePath($root, $destination);
+            if (transcode($r->chanid, $r->starttime, $dpath)) {
+                if(array_key_exists('m',$opts))
+                {
+                    if (file_exists($root . $dpath)) {
+                        unlink($filepath);
+                        $db->query("DELETE FROM recorded WHERE basename=:n", array("n" => $r->basename));
+                        print " [deleted]";
+                    } else {
+                        print " [not deleted]";
+                    }
+                }
+            } else {
+                if (array_key_exists('C', $opts)) {
+                    print " [copying...";
+                    $c = array(
+                        "cp",
+                        escapeshellarg($filepath),
+                        escapeshellarg($root . $dpath)
+                    );
+                    $m = system(implode(" ", $c), $ret);
+                    print "ok]";
+                    if(array_key_exists('m',$opts))
+                    {
+                        if (file_exists($root . $dpath)) {
+                            unlink($filepath);
+                            $db->query("DELETE FROM recorded WHERE basename=:n", array("n" => $r->basename));
+                            print " [deleted]";
+                        } else {
+                            print " [not deleted]";
+                        }
+                    }
+                }
+            }
+        }
+        print "\n";
+	}
+}
+
+function transcode($chanid, $starttime, $dpath)
+{
+    global $root;
+
+    $dpbits = explode("/", $dpath);
+
+    $destFile = array_pop($dpbits);
+    $tempFile = "." . $destFile;
+    $destPath = $root . implode("/", $dpbits);
+
+    $destFull = $destPath . "/" . $destFile;
+    $tempFull = $destPath . "/" . $tempFile;
+    $mapFull = $tempFull . ".map";
+
+	$cmd = array(
+		"mythtranscode",
+		"--chanid", escapeshellarg($chanid),
+		"--starttime", escapeshellarg($starttime),
+		"--outfile", escapeshellarg($tempFull),
+		"--mpeg2",
+		"--honorcutlist",
+		"-v", "none"
+	);
+
+	$c = implode(" ", $cmd);
+
+	$m = system($c, $ret);
+	trim($m);
+	if ($ret == 0) {
+        rename($tempFull, $destFull);
+        @unlink($mapFull);
+		print "ok]";
+		return true;
+	} else {
+		print "error]";
+        @unlink($tempFull);
+		return false;
+	}
+}
+
+function usage()
+{
+	print "Usage:\n";
+	print "  mythcopy [-m/-c] -t title [-s title] [-u] [-f]\n";
+	print "  mythcopy [-m/-c] -i id -d destination [-f]\n";
+	exit;
+}
+
+
+function generateFilename($r)
+{
+	if ($r->season > 0 && $r->episode > 0) {
+		return array("TV", fixString($r->title), "Season " . $r->season, sprintf("%s - %dx%02d - %s.mpg", fixString($r->title), $r->season, $r->episode, fixString($r->subtitle)));
+	}
+
+	if ($r->subtitle != "") {
+		return array("TV", fixString($r->title), sprintf("%s - %s.mpg", fixString($r->title), fixString($r->subtitle)));
+	}
+
+	return array("Films", fixString($r->title) . ".mpg");
+}
+
+function makePath($root, $path)
+{
+	$where = $root;
+	while ($bit = array_shift($path)) {
+		if (count($path) > 0) {
+			$where = $where . "/" . $bit;
+			if (!file_exists($where)) {	
+				mkdir($where);
+			}
+		}
+	}
+}
+
+function fixString($in) {
+    $in = str_replace("/", " - ", $in);
+    $in = str_replace(":", "", $in);
+    return $in;
+}
+
+function getStorageGroup($name) {
+    global $db;
+    $q = $db->query("SELECT * FROM storagegroup WHERE groupname=:name", array("name" => $name));
+    $fp = array();
+    while ($r = $db->nextRecord($q)) {
+        $fp[] = $r->dirname;
+    }
+    if (count($fp) == 0) {
+        return false;
+    }
+    return $fp;
+}
+
+
