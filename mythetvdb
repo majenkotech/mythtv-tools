@@ -1,0 +1,209 @@
+#!/usr/bin/php
+<?php
+
+require_once __DIR__ . "/vendor/autoload.php";
+
+$configfile = file_get_contents(getenv("HOME") . "/.mythtv/config.xml");
+$config = new SimpleXMLElement($configfile);
+
+$db = new \Majenkotech\DB(
+    $config->Database->UserName,
+    $config->Database->Password,
+    $config->Database->Host,
+    $config->Database->DatabaseName
+);
+
+
+$opts = getopt("t:p");
+
+if (array_key_exists('t', $opts)) {
+	$threshold = $opts['t'];
+} else {
+	$threshold = 99;
+}
+
+$titles = array(
+    "Doctor Who" => "Doctor Who (2005)",
+    "Battlestar Galactica" => "Battlestar Galactica (2003)"
+);
+
+$key = "C2BB0D2257D5EB83";
+
+$mirrors = file_get_contents("http://thetvdb.com/api/$key/mirrors.xml");
+$xml = new SimpleXMLElement($mirrors);
+$mirror = (string)$xml->Mirror->mirrorpath[0];
+
+print "Using mirror: $mirror\n";
+
+$seriesCache = array();
+$seriesDataCache = array();
+
+$q = $db->query("SELECT * FROM recorded where deletepending=0");
+while ($r = $db->nextRecord($q)) {
+    if (array_key_exists($r->title, $titles)) {
+        $r->title = $titles[$r->title];
+    }
+	if ($r->season != 0 && $r->episode != 0) {
+		continue;
+	}
+
+    if ($r->subtitle == "") {
+        continue;
+    }
+
+	$series = getSeries($r->title);
+	if ($series) {
+		$data = getSeriesData((string)$series->id);
+		if ($data) {
+            if (array_key_exists('p', $opts)) {
+                $searchingfor = substr($r->subtitle . " " . $r->description, 0, 255);
+            } else {
+                $searchingfor = substr($r->subtitle, 0, 255);
+            }
+			$matches = array();
+
+			foreach ($data as $episode) {
+                if (array_key_exists('p', $opts)) {
+                    $matchagainst =substr((string)$episode->EpisodeName . " " . (string)$episode->Overview, 0, 255);
+                } else {
+                    $matchagainst =substr((string)$episode->EpisodeName, 0, 255);
+                }
+				similar_text($searchingfor, $matchagainst, $pct);
+				if ($pct > 30) {
+					$episode->match = $pct;
+					$md = new stdClass;
+					$md->matchPercent = $pct;
+					$md->data = $episode;
+					$matches[] = $md;
+				}
+			}
+
+			usort($matches, "levsort");
+			print "\n\n";
+			print $r->title . ": " . $r->subtitle . "\n". $r->description . "\n";
+			print "\n";
+
+			$done = false;
+            if (count($matches) == 0) {
+                $done = 1;
+            } else if ($matches[0]->matchPercent >= $threshold) {
+				setEpisodeData($r, $matches[0]->data->EpisodeName, $matches[0]->data->EpisodeNumber, $matches[0]->data->SeasonNumber);
+				$done = true;
+			}	
+
+			if (!$done)
+			{
+                $cnt = 0;
+				foreach ($matches as $i=>$m) {
+					print "$i: ";
+					print $m->matchPercent . ": " . $m->data->EpisodeName . "\n";
+                    $cnt++;
+                    if ($cnt > 15) {
+                        break;
+                    }
+				}
+				while(true) {
+					print "0-" . (count($matches)-1) . " ? or s > ";
+					$id = trim(fgets(STDIN));
+					if ($id === false || $id == "") {
+						continue;
+					}
+					if ($id == "s") {
+						break;
+					}
+
+					if ($id == "?") {
+						foreach ($matches as $i=>$m) {
+							print "$i: ";
+							print $m->matchPercent . ": " . $m->data->EpisodeName . "\n";
+						}
+					}
+					if (substr($id,0,1) == "?") {
+						print $r->title . ": " . $r->subtitle . "\n". $r->description . "\n";
+						print "--------------------------------\n";
+						print $matches[substr($id,1,99)]->data->Overview . "\n";
+						continue;
+					}	
+					if ($id >= 0 & $id < count($matches)) {
+						setEpisodeData($r, $matches[$id]->data->EpisodeName, $matches[$id]->data->EpisodeNumber, $matches[$id]->data->SeasonNumber);
+						break;
+					}
+				}
+			}
+		}
+	}
+}
+
+function levsort($a, $b)
+{
+	if ($a->matchPercent == $b->matchPercent) {
+		return 0;
+	}
+
+	if ($a->matchPercent < $b->matchPercent) {
+		return 1;
+	}
+
+	return -1;
+}
+
+
+function getSeries($name)
+{
+	global $seriesCache;
+	global $mirror;
+	if (array_key_exists($name, $seriesCache)) {
+		return $seriesCache[$name];
+	}
+
+	$series = file_get_contents("$mirror/api/GetSeries.php?seriesname=" . urlencode($name));
+	$xml = simplexml_load_string($series);
+	if ($xml->Series) {
+		foreach ($xml->Series as $s) {
+			if ($s->SeriesName == $name) {
+				$seriesCache[$name] = $s;
+				return $s;
+			}
+		}
+	}
+	return false;
+}
+
+function getSeriesData($id)
+{
+	global $key;
+	global $mirror;
+	global $seriesDataCache;
+
+	if (array_key_exists($id, $seriesDataCache)) {
+		return $seriesDataCache[$id];
+	}
+
+	$data = file_get_contents("$mirror/api/$key/series/$id/all/en.zip");
+	file_put_contents("/tmp/series$id.zip", $data);
+	$zip = zip_open("/tmp/series$id.zip");
+
+	while ($e = zip_read($zip)) {
+		if (zip_entry_name($e) == 'en.xml') {
+			$data = zip_entry_read($e, 999999999);
+			$xml = simplexml_load_string($data);
+			$seriesDataCache[$id] = $xml;
+			return $xml;
+		}
+	}
+	return false;
+}
+
+function setEpisodeData($r, $title, $episode, $season)
+{
+    global $db;
+	$q = $db->query("UPDATE recorded SET title=:title, subtitle=:subtitle, episode=:episode, season=:season WHERE chanid=:chanid AND starttime=:starttime",
+        array(
+            "title" => $r->title, 
+            "subtitle" => $title, 
+            "episode" => $episode, 
+            "season" => $season, 
+            "chanid" => $r->chanid, 
+            "starttime" => $r->starttime
+    ));
+}
