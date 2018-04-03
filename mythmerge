@@ -1,0 +1,85 @@
+#!/usr/bin/php
+<?php
+
+require_once __DIR__ . "/vendor/autoload.php";
+
+$configfile = file_get_contents(getenv("HOME") . "/.mythtv/config.xml");
+$config = new SimpleXMLElement($configfile);
+
+$db = new \Majenkotech\DB(
+    $config->Database->UserName,
+    $config->Database->Password,
+    $config->Database->Host,
+    $config->Database->DatabaseName
+);
+
+
+$q = $db->query("SELECT DISTINCT chanid, title FROM record WHERE type=1 AND inactive=0");
+while ($r = $db->nextRecord($q)) {
+    $recs = getRecordings($r->chanid, $r->title);
+    if (count($recs) == 2) { // Only handle single splits
+        $mstart = 999999999999;
+        $mend = 0;
+        print "Title: " . $r->title . "\n";
+        foreach ($recs as $rec) {
+            $start = $rec->startdate . " " . $rec->starttime;
+            $end = $rec->enddate . " " . $rec->endtime;
+
+            $tstart = strtotime($start);
+            $tend = strtotime($end);
+
+            if ($tstart < $mstart) $mstart = $tstart;
+            if ($tend > $mend) $mend = $tend;
+
+
+            print "$start -> $end ($tstart -> $tend)\n";
+        }
+
+        if ($mend - $mstart < (60*60*4)) { // Maximum 4 hours. Nothing should run more than that long.
+            print "Total: $mstart -> $mend\n";
+            $q1 = $db->query("SELECT * FROM record WHERE chanid=:chanid AND title=:title AND startdate=:startdate AND starttime=:starttime", array(
+                "chanid" => $rec->chanid,
+                "title" => $rec->title,
+                "startdate" => date("Y-m-d", $mstart),
+                "starttime" => date("H:i:s", $mstart)
+            ));
+            $startRecording = $db->nextRecord($q1);
+            $q1 = $db->query("SELECT * FROM record WHERE chanid=:chanid AND title=:title AND enddate=:enddate AND endtime=:endtime", array(
+                "chanid" => $rec->chanid,
+                "title" => $rec->title,
+                "enddate" => date("Y-m-d", $mend),
+                "endtime" => date("H:i:s", $mend)
+            ));
+            $endRecording = $db->nextRecord($q1);
+
+            print "Merge this recording? (y/N) : ";
+
+            $ans = trim(fgets(STDIN));
+
+            if ($ans == 'y' || $ans == 'Y') {
+                $db->query("UPDATE record SET endtime=:endtime, enddate=:enddate WHERE recordid=:recordid", array(
+                    "enddate" => date("Y-m-d", $mend),
+                    "endtime" => date("H:i:s", $mend),
+                    "recordid" => $startRecording->recordid
+                ));
+                $db->query("UPDATE record SET inactive=1 WHERE recordid=:recordid", array(
+                    "recordid" => $endRecording->recordid
+                ));
+            }
+        }
+    }
+}
+
+function getRecordings($chan, $title) {
+    global $db;
+    $q = $db->query("SELECT * FROM record WHERE type=1 AND inactive=0 AND chanid=:chan AND title=:title", array(
+        "chan" => $chan,
+        "title" => $title
+    ));
+
+    $o = array();
+    while ($r = $db->nextRecord($q)) {
+        $o[] = $r;
+    }
+    return $o;
+}
